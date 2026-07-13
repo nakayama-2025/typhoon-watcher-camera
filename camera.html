@@ -13,23 +13,36 @@
     input { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; }
     button { padding: 10px 15px; margin-right: 10px; margin-bottom: 10px; cursor: pointer; border: none; border-radius: 4px; background: #28a745; color: white; font-weight: bold; }
     button:disabled { background: #ccc; cursor: not-allowed; }
-    #stopAutoBtn { background: #dc3545; display: none; }
-    #status { padding: 10px; margin-top: 10px; border-radius: 4px; display: none; }
+    .btn-secondary { background: #6c757d; }
+    .btn-danger { background: #dc3545; }
+    #status { padding: 10px; margin-top: 10px; border-radius: 4px; display: none; font-weight: bold; }
     .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
     .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    .info { background: #cce5ff; color: #004085; border: 1px solid #b8daff; }
   </style>
 </head>
 <body>
-  <h2>設置端末カメラ</h2>
+  <h2>設置端末カメラ (Ver 0.2)</h2>
   
+  <!-- 設定エリア -->
   <div class="form-group">
-    <label for="cameraId">カメラID</label>
-    <input type="text" id="cameraId" value="CAM-001">
+    <label for="cameraId">カメラID (例: CAM-001)</label>
+    <input type="text" id="cameraId" placeholder="CAM-001">
   </div>
   <div class="form-group">
     <label for="location">設置場所</label>
-    <input type="text" id="location" value="紙保管倉庫_奥天井">
+    <input type="text" id="location" placeholder="紙保管倉庫_奥天井">
   </div>
+  <div class="form-group">
+    <label for="token">端末トークン</label>
+    <input type="password" id="token" placeholder="トークンを入力">
+  </div>
+  <div>
+    <button id="saveConfigBtn" class="btn-secondary">設定保存</button>
+    <button id="clearConfigBtn" class="btn-danger">設定削除</button>
+  </div>
+
+  <hr>
 
   <video id="video" autoplay playsinline></video>
   <canvas id="canvas"></canvas>
@@ -38,116 +51,177 @@
     <button id="startCameraBtn">カメラ起動</button>
     <button id="manualCaptureBtn" disabled>今すぐ手動撮影送信</button>
   </div>
-  <div>
-    <button id="startAutoBtn" disabled>30分間隔の自動撮影 開始</button>
-    <button id="stopAutoBtn">自動撮影 停止</button>
-  </div>
 
   <div id="status"></div>
 
   <script>
-    // 送信先 GAS WebアプリのURL（後で実URLに置き換えてください）
-    const GAS_ENDPOINT_URL = "__GAS_WEB_APP_URL__";
+    // ------------------------------------
+    // GASのURLはデプロイ後に手動で置き換えます
+    // ※ 秘密情報はコード内に直接書かないでください
+    // ------------------------------------
+    const GAS_ENDPOINT_URL = "https://script.google.com/macros/s/AKfycbzi6yJz6vIEJ3c0g5P_QdZlXSMEOphWZCaZPxuCGGjLz0fBLxFlOcafKASK5S78bvelIQ/exec";
     
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
     const startCameraBtn = document.getElementById('startCameraBtn');
     const manualCaptureBtn = document.getElementById('manualCaptureBtn');
-    const startAutoBtn = document.getElementById('startAutoBtn');
-    const stopAutoBtn = document.getElementById('stopAutoBtn');
-    const statusDiv = document.getElementById('status');
     
+    const inputCameraId = document.getElementById('cameraId');
+    const inputLocation = document.getElementById('location');
+    const inputToken = document.getElementById('token');
+    const saveConfigBtn = document.getElementById('saveConfigBtn');
+    const clearConfigBtn = document.getElementById('clearConfigBtn');
+    
+    const statusDiv = document.getElementById('status');
     let stream = null;
-    let autoInterval = null;
 
-    function showStatus(msg, isError = false) {
-      statusDiv.style.display = 'block';
-      statusDiv.textContent = msg;
-      statusDiv.className = isError ? 'error' : 'success';
+    // --- localStorage 関連 ---
+    const STORAGE_KEYS = {
+      cameraId: 'typhoonWatcher.cameraId',
+      location: 'typhoonWatcher.location',
+      token: 'typhoonWatcher.token'
+    };
+
+    function loadConfig() {
+      inputCameraId.value = localStorage.getItem(STORAGE_KEYS.cameraId) || '';
+      inputLocation.value = localStorage.getItem(STORAGE_KEYS.location) || '';
+      inputToken.value = localStorage.getItem(STORAGE_KEYS.token) || '';
     }
 
+    saveConfigBtn.addEventListener('click', () => {
+      localStorage.setItem(STORAGE_KEYS.cameraId, inputCameraId.value.trim());
+      localStorage.setItem(STORAGE_KEYS.location, inputLocation.value.trim());
+      localStorage.setItem(STORAGE_KEYS.token, inputToken.value.trim());
+      showStatus('設定を保存しました', 'success');
+    });
+
+    clearConfigBtn.addEventListener('click', () => {
+      localStorage.removeItem(STORAGE_KEYS.cameraId);
+      localStorage.removeItem(STORAGE_KEYS.location);
+      localStorage.removeItem(STORAGE_KEYS.token);
+      inputCameraId.value = '';
+      inputLocation.value = '';
+      inputToken.value = '';
+      showStatus('設定を削除しました', 'info');
+    });
+
+    // 初期読み込み
+    loadConfig();
+
+    // --- ステータス表示 ---
+    function showStatus(msg, type = 'info') {
+      statusDiv.style.display = 'block';
+      statusDiv.textContent = msg;
+      statusDiv.className = type;
+    }
+
+    // --- カメラ操作 ---
     startCameraBtn.addEventListener('click', async () => {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
         video.srcObject = stream;
         
         manualCaptureBtn.disabled = false;
-        startAutoBtn.disabled = false;
-        
-        showStatus('カメラを起動しました');
+        showStatus('カメラを起動しました', 'success');
       } catch (err) {
-        showStatus(`カメラ起動エラー: ${err.name} - ${err.message}`, true);
+        showStatus(`カメラ起動エラー: ${err.name} - ${err.message}`, 'error');
       }
     });
 
     async function captureAndSend() {
-      if (!stream) {
-        showStatus('カメラが起動していません', true);
+      const cameraId = inputCameraId.value.trim();
+      const location = inputLocation.value.trim();
+      const token = inputToken.value.trim();
+
+      // 送信条件のチェック
+      if (!cameraId || !location || !token) {
+        showStatus('エラー: カメラID、設置場所、トークンをすべて入力・保存してください', 'error');
+        return;
+      }
+      if (!stream || !stream.active) {
+        showStatus('エラー: カメラが停止しています。再度カメラを起動してください', 'error');
         return;
       }
       if (video.videoWidth === 0 || video.videoHeight === 0) {
-        showStatus('カメラの映像が取得できません (width/height = 0)', true);
+        showStatus('エラー: 撮影画像がまだ生成されていません', 'error');
+        return;
+      }
+      if (GAS_ENDPOINT_URL === "__GAS_WEB_APP_URL__") {
+        showStatus('エラー: GAS URL未設定。送信を停止しました', 'error');
         return;
       }
 
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
-      const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, "");
+      // 二重送信防止
+      manualCaptureBtn.disabled = true;
+      showStatus('送信準備中...', 'info');
 
-      const payload = {
-        camera_id: document.getElementById('cameraId').value,
-        location: document.getElementById('location').value,
-        image_data: base64Data
-      };
-
-      showStatus('送信中...');
       try {
+        // 画像の圧縮設定 (長辺1280px程度)
+        const MAX_DIMENSION = 1280;
+        let width = video.videoWidth;
+        let height = video.videoHeight;
+        
+        if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+          if (width > height) {
+            height = Math.floor(height * (MAX_DIMENSION / width));
+            width = MAX_DIMENSION;
+          } else {
+            width = Math.floor(width * (MAX_DIMENSION / height));
+            height = MAX_DIMENSION;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, width, height);
+        
+        // JPEG品質0.8
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.80);
+        // Base64本体のみを抽出
+        const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, "");
+
+        const payload = {
+          camera_id: cameraId,
+          location: location,
+          token: token,
+          image_data: base64Data
+        };
+
+        showStatus('送信中...', 'info');
+
+        // CORSプリフライト回避のため text/plain で送信
         const response = await fetch(GAS_ENDPOINT_URL, {
           method: 'POST',
-          // preflight回避やCORSエラー対策のため、あえて text/plain で送るのが確実です。
-          // GAS側は JSON.parse(e.postData.contents) で受け取れます。
           headers: {
-            'Content-Type': 'text/plain'
+            'Content-Type': 'text/plain;charset=utf-8'
           },
           body: JSON.stringify(payload)
         });
         
-        const resData = await response.json().catch(() => null);
+        const resData = await response.json();
         
         if (resData && resData.status === 'success') {
-          showStatus(`送信成功: ${new Date().toLocaleTimeString()}`);
+          showStatus(`保存成功: ${new Date().toLocaleTimeString()}`, 'success');
         } else {
-          showStatus(`送信実行完了（ダッシュボード側で確認してください）: ${new Date().toLocaleTimeString()}`);
+          // 認証失敗やGAS側のバリデーションエラー
+          // ※トークンは自動削除せず、修正できるように残す
+          const errMsg = resData ? resData.message : "不明なエラー";
+          showStatus(`認証失敗 / 保存エラー: ${errMsg}`, 'error');
         }
       } catch (err) {
-        showStatus(`送信を実行しました（CORS等で読めない可能性があります・ダッシュボード確認推奨）: ${err.message}`, true);
+        showStatus(`通信エラー: ${err.message}`, 'error');
+      } finally {
+        // 数秒後にボタンを再度有効化（連続クリック防止）
+        setTimeout(() => {
+          if (stream && stream.active) {
+            manualCaptureBtn.disabled = false;
+          }
+        }, 3000);
       }
     }
 
     manualCaptureBtn.addEventListener('click', captureAndSend);
-
-    startAutoBtn.addEventListener('click', () => {
-      captureAndSend();
-      autoInterval = setInterval(captureAndSend, 30 * 60 * 1000);
-      
-      startAutoBtn.style.display = 'none';
-      stopAutoBtn.style.display = 'inline-block';
-      showStatus('自動撮影を開始しました');
-    });
-
-    stopAutoBtn.addEventListener('click', () => {
-      if (autoInterval) {
-        clearInterval(autoInterval);
-        autoInterval = null;
-      }
-      stopAutoBtn.style.display = 'none';
-      startAutoBtn.style.display = 'inline-block';
-      showStatus('自動撮影を停止しました');
-    });
   </script>
 </body>
 </html>
