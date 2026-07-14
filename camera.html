@@ -22,7 +22,7 @@
   </style>
 </head>
 <body>
-<h2>設置端末カメラ (Ver 0.3・1分テスト)</h2>
+<h2>設置端末カメラ (Ver 0.3・30分間隔)</h2>
   
   <!-- 設定エリア -->
   <div class="form-group">
@@ -54,7 +54,7 @@
 
   <div>
     <button id="startAutoCaptureBtn" disabled>
-      自動撮影開始（1分テスト）
+自動撮影開始（30分間隔）
     </button>
     <button id="stopAutoCaptureBtn" class="btn-danger" disabled>
       自動撮影停止
@@ -93,8 +93,8 @@
     
     const statusDiv = document.getElementById('status');
 
-    // 自動撮影間隔：Version 0.3の動作試験中は1分
-    const AUTO_CAPTURE_INTERVAL_MS = 60 * 1000;
+// 自動撮影間隔：Version 0.3の運用設定は30分
+const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
 
     let stream = null;
     let autoCaptureTimerId = null;
