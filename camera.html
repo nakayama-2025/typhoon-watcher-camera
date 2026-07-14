@@ -22,7 +22,7 @@
   </style>
 </head>
 <body>
-  <h2>設置端末カメラ (Ver 0.2)</h2>
+<h2>設置端末カメラ (Ver 0.3・1分テスト)</h2>
   
   <!-- 設定エリア -->
   <div class="form-group">
@@ -52,6 +52,21 @@
     <button id="manualCaptureBtn" disabled>今すぐ手動撮影送信</button>
   </div>
 
+  <div>
+    <button id="startAutoCaptureBtn" disabled>
+      自動撮影開始（1分テスト）
+    </button>
+    <button id="stopAutoCaptureBtn" class="btn-danger" disabled>
+      自動撮影停止
+    </button>
+  </div>
+
+  <div
+    id="countdown"
+    class="info"
+    style="display:none; padding:10px; margin-top:10px; border-radius:4px; font-weight:bold;"
+  ></div>
+
   <div id="status"></div>
 
   <script>
@@ -65,6 +80,10 @@
     const canvas = document.getElementById('canvas');
     const startCameraBtn = document.getElementById('startCameraBtn');
     const manualCaptureBtn = document.getElementById('manualCaptureBtn');
+
+    const startAutoCaptureBtn = document.getElementById('startAutoCaptureBtn');
+    const stopAutoCaptureBtn = document.getElementById('stopAutoCaptureBtn');
+    const countdownDiv = document.getElementById('countdown');
     
     const inputCameraId = document.getElementById('cameraId');
     const inputLocation = document.getElementById('location');
@@ -73,7 +92,17 @@
     const clearConfigBtn = document.getElementById('clearConfigBtn');
     
     const statusDiv = document.getElementById('status');
+
+    // 自動撮影間隔：Version 0.3の動作試験中は1分
+    const AUTO_CAPTURE_INTERVAL_MS = 60 * 1000;
+
     let stream = null;
+    let autoCaptureTimerId = null;
+    let countdownTimerId = null;
+    let nextCaptureAt = null;
+    let isSending = false;
+    let isAutoCaptureRunning = false;
+    let wakeLock = null;
 
     // --- localStorage 関連 ---
     const STORAGE_KEYS = {
@@ -115,6 +144,81 @@
       statusDiv.className = type;
     }
 
+    // --- 自動撮影カウントダウン ---
+    function updateCountdownDisplay() {
+      if (!nextCaptureAt) {
+        countdownDiv.style.display = 'none';
+        countdownDiv.textContent = '';
+        return;
+      }
+
+      const remainingMs = Math.max(0, nextCaptureAt - Date.now());
+      const totalSeconds = Math.ceil(remainingMs / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+
+      countdownDiv.style.display = 'block';
+      countdownDiv.textContent =
+        `次回の自動撮影まで ${minutes}:${String(seconds).padStart(2, '0')}`;
+    }
+
+    function startCountdown() {
+      if (countdownTimerId !== null) {
+        clearInterval(countdownTimerId);
+      }
+
+      updateCountdownDisplay();
+
+      countdownTimerId = setInterval(() => {
+        updateCountdownDisplay();
+      }, 1000);
+    }
+
+    function stopCountdown() {
+      if (countdownTimerId !== null) {
+        clearInterval(countdownTimerId);
+        countdownTimerId = null;
+      }
+
+      nextCaptureAt = null;
+      countdownDiv.style.display = 'none';
+      countdownDiv.textContent = '';
+    }
+
+    // --- Wake Lock ---
+    async function requestWakeLock() {
+      if (!('wakeLock' in navigator)) {
+        console.log('この端末はWake Lockに対応していません');
+        return;
+      }
+
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+
+        wakeLock.addEventListener('release', () => {
+          wakeLock = null;
+          console.log('Wake Lockが解除されました');
+        });
+
+        console.log('Wake Lockを取得しました');
+      } catch (err) {
+        wakeLock = null;
+        console.log(`Wake Lock取得エラー: ${err.name} - ${err.message}`);
+      }
+    }
+
+    async function releaseWakeLock() {
+      if (wakeLock !== null) {
+        try {
+          await wakeLock.release();
+        } catch (err) {
+          console.log(`Wake Lock解除エラー: ${err.message}`);
+        } finally {
+          wakeLock = null;
+        }
+      }
+    }
+
     // --- カメラ操作 ---
     startCameraBtn.addEventListener('click', async () => {
       try {
@@ -122,6 +226,7 @@
         video.srcObject = stream;
         
         manualCaptureBtn.disabled = false;
+        startAutoCaptureBtn.disabled = false;
         showStatus('カメラを起動しました', 'success');
       } catch (err) {
         showStatus(`カメラ起動エラー: ${err.name} - ${err.message}`, 'error');
@@ -129,6 +234,11 @@
     });
 
     async function captureAndSend() {
+      if (isSending) {
+        showStatus('送信中のため、今回の撮影は見送りました', 'info');
+        return;
+      }
+
       const cameraId = inputCameraId.value.trim();
       const location = inputLocation.value.trim();
       const token = inputToken.value.trim();
@@ -151,7 +261,8 @@
         return;
       }
 
-      // 二重送信防止
+      // 手動撮影と自動撮影の重複送信を防止
+      isSending = true;
       manualCaptureBtn.disabled = true;
       showStatus('送信準備中...', 'info');
 
@@ -212,6 +323,8 @@
       } catch (err) {
         showStatus(`通信エラー: ${err.message}`, 'error');
       } finally {
+        isSending = false;
+
         // 数秒後にボタンを再度有効化（連続クリック防止）
         setTimeout(() => {
           if (stream && stream.active) {
@@ -221,7 +334,115 @@
       }
     }
 
-    manualCaptureBtn.addEventListener('click', captureAndSend);
+    // --- 自動撮影の開始・停止 ---
+    function scheduleNextAutoCapture() {
+      if (!isAutoCaptureRunning) {
+        return;
+      }
+
+      nextCaptureAt = Date.now() + AUTO_CAPTURE_INTERVAL_MS;
+      startCountdown();
+
+      autoCaptureTimerId = setTimeout(async () => {
+        autoCaptureTimerId = null;
+
+        try {
+          await captureAndSend();
+        } catch (err) {
+          // 1回失敗しても自動撮影自体は停止しない
+          showStatus(`自動撮影エラー: ${err.message}`, 'error');
+        } finally {
+          if (isAutoCaptureRunning) {
+            scheduleNextAutoCapture();
+          }
+        }
+      }, AUTO_CAPTURE_INTERVAL_MS);
+    }
+
+    async function startAutoCapture() {
+
+      // 二重タイマー防止
+      if (isAutoCaptureRunning) {
+        showStatus('自動撮影はすでに開始されています', 'info');
+        return;
+      }
+
+      if (!stream || !stream.active) {
+        showStatus('エラー: 先にカメラを起動してください', 'error');
+        return;
+      }
+
+      isAutoCaptureRunning = true;
+      startAutoCaptureBtn.disabled = true;
+      stopAutoCaptureBtn.disabled = false;
+
+      await requestWakeLock();
+
+      showStatus(
+        '自動撮影を開始しました。最初の1枚を撮影します',
+        'info'
+      );
+
+      // 開始直後に1枚撮影
+      try {
+        await captureAndSend();
+      } catch (err) {
+        showStatus(`自動撮影エラー: ${err.message}`, 'error');
+      }
+
+      // 最初の撮影中に停止ボタンが押された場合は、
+      // タイマーを開始しない
+      if (!isAutoCaptureRunning) {
+        return;
+      }
+
+      scheduleNextAutoCapture();
+    }
+
+    async function stopAutoCapture() {
+      isAutoCaptureRunning = false;
+
+      if (autoCaptureTimerId !== null) {
+        clearTimeout(autoCaptureTimerId);
+        autoCaptureTimerId = null;
+      }
+
+      stopCountdown();
+
+      startAutoCaptureBtn.disabled =
+        !(stream && stream.active);
+      stopAutoCaptureBtn.disabled = true;
+
+      await releaseWakeLock();
+
+      showStatus('自動撮影を停止しました', 'info');
+    }
+
+    manualCaptureBtn.addEventListener(
+      'click',
+      captureAndSend
+    );
+
+    startAutoCaptureBtn.addEventListener(
+      'click',
+      startAutoCapture
+    );
+
+    stopAutoCaptureBtn.addEventListener(
+      'click',
+      stopAutoCapture
+    );
+
+    // 別画面から戻った際にWake Lockを再取得
+    document.addEventListener('visibilitychange', async () => {
+      if (
+        document.visibilityState === 'visible' &&
+        isAutoCaptureRunning &&
+        wakeLock === null
+      ) {
+        await requestWakeLock();
+      }
+    });
   </script>
 </body>
 </html>
