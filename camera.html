@@ -15,18 +15,19 @@
     button:disabled { background: #ccc; cursor: not-allowed; }
     .btn-secondary { background: #6c757d; }
     .btn-danger { background: #dc3545; }
-    #status { padding: 10px; margin-top: 10px; border-radius: 4px; display: none; font-weight: bold; }
+    #status, #queueStatus { padding: 10px; margin-top: 10px; border-radius: 4px; font-weight: bold; }
+    #status { display: none; }
     .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
     .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
     .info { background: #cce5ff; color: #004085; border: 1px solid #b8daff; }
   </style>
 </head>
 <body>
-<h2>設置端末カメラ (Ver 0.3・30分間隔)</h2>
-  
+  <h2>設置端末カメラ（Ver 0.5・通信障害時再送対応）</h2>
+
   <!-- 設定エリア -->
   <div class="form-group">
-    <label for="cameraId">カメラID (例: CAM-001)</label>
+    <label for="cameraId">カメラID（例: CAM-001）</label>
     <input type="text" id="cameraId" placeholder="CAM-001">
   </div>
   <div class="form-group">
@@ -36,6 +37,15 @@
   <div class="form-group">
     <label for="token">端末トークン</label>
     <input type="password" id="token" placeholder="トークンを入力">
+  </div>
+  <div class="form-group">
+    <label for="gasEndpointUrl">GAS WebアプリURL（この端末内だけに保存）</label>
+    <input
+      type="password"
+      id="gasEndpointUrl"
+      placeholder="https://script.google.com/macros/s/.../exec"
+      autocomplete="off"
+    >
   </div>
   <div>
     <button id="saveConfigBtn" class="btn-secondary">設定保存</button>
@@ -54,12 +64,20 @@
 
   <div>
     <button id="startAutoCaptureBtn" disabled>
-自動撮影開始（30分間隔）
+      自動撮影開始（30分間隔）
     </button>
     <button id="stopAutoCaptureBtn" class="btn-danger" disabled>
       自動撮影停止
     </button>
   </div>
+
+  <div>
+    <button id="retryPendingBtn" class="btn-secondary" disabled>
+      未送信画像を再送
+    </button>
+  </div>
+
+  <div id="queueStatus" class="info">未送信画像: 確認中...</div>
 
   <div
     id="countdown"
@@ -71,77 +89,319 @@
 
   <script>
     // ------------------------------------
-    // GASのURLはデプロイ後に手動で置き換えます
-    // ※ 秘密情報はコード内に直接書かないでください
+    // GAS URLは公開コードへ記載せず、各端末のlocalStorageへ保存する
     // ------------------------------------
-    const GAS_ENDPOINT_URL = "https://script.google.com/macros/s/AKfycbzi6yJz6vIEJ3c0g5P_QdZlXSMEOphWZCaZPxuCGGjLz0fBLxFlOcafKASK5S78bvelIQ/exec";
-    
+
+    // 自動撮影間隔：30分
+    const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
+
+    // 通信再試行：1分ごと、1回の通信は30秒で打ち切る
+    const RETRY_CHECK_INTERVAL_MS = 60 * 1000;
+    const FETCH_TIMEOUT_MS = 30 * 1000;
+
+    // 72時間運用（30分間隔で約145枚）を想定した端末内上限
+    const MAX_PENDING_ITEMS = 150;
+
+    // IndexedDB設定
+    const DB_NAME = 'typhoonWatcherOfflineDB';
+    const DB_VERSION = 1;
+    const STORE_NAME = 'pendingImages';
+
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
     const startCameraBtn = document.getElementById('startCameraBtn');
     const manualCaptureBtn = document.getElementById('manualCaptureBtn');
-
     const startAutoCaptureBtn = document.getElementById('startAutoCaptureBtn');
     const stopAutoCaptureBtn = document.getElementById('stopAutoCaptureBtn');
+    const retryPendingBtn = document.getElementById('retryPendingBtn');
     const countdownDiv = document.getElementById('countdown');
-    
+    const queueStatusDiv = document.getElementById('queueStatus');
+
     const inputCameraId = document.getElementById('cameraId');
     const inputLocation = document.getElementById('location');
     const inputToken = document.getElementById('token');
+    const inputGasEndpointUrl = document.getElementById('gasEndpointUrl');
     const saveConfigBtn = document.getElementById('saveConfigBtn');
     const clearConfigBtn = document.getElementById('clearConfigBtn');
-    
     const statusDiv = document.getElementById('status');
-
-// 自動撮影間隔：Version 0.3の運用設定は30分
-const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
 
     let stream = null;
     let autoCaptureTimerId = null;
     let countdownTimerId = null;
     let nextCaptureAt = null;
-    let isSending = false;
+    let isCapturing = false;
+    let isQueueFlushing = false;
     let isAutoCaptureRunning = false;
     let wakeLock = null;
+    let pendingCount = 0;
+    let dbPromise = null;
 
     // --- localStorage 関連 ---
     const STORAGE_KEYS = {
       cameraId: 'typhoonWatcher.cameraId',
       location: 'typhoonWatcher.location',
-      token: 'typhoonWatcher.token'
+      token: 'typhoonWatcher.token',
+      gasEndpointUrl: 'typhoonWatcher.gasEndpointUrl'
     };
 
     function loadConfig() {
       inputCameraId.value = localStorage.getItem(STORAGE_KEYS.cameraId) || '';
       inputLocation.value = localStorage.getItem(STORAGE_KEYS.location) || '';
       inputToken.value = localStorage.getItem(STORAGE_KEYS.token) || '';
+      inputGasEndpointUrl.value =
+        localStorage.getItem(STORAGE_KEYS.gasEndpointUrl) || '';
     }
 
-    saveConfigBtn.addEventListener('click', () => {
+    saveConfigBtn.addEventListener('click', async () => {
+      const gasEndpointUrl = getGasEndpointUrl();
+      if (gasEndpointUrl && !isValidGasEndpointUrl(gasEndpointUrl)) {
+        showStatus(
+          'エラー: GAS WebアプリURLの形式を確認してください',
+          'error'
+        );
+        return;
+      }
+
       localStorage.setItem(STORAGE_KEYS.cameraId, inputCameraId.value.trim());
       localStorage.setItem(STORAGE_KEYS.location, inputLocation.value.trim());
       localStorage.setItem(STORAGE_KEYS.token, inputToken.value.trim());
+      localStorage.setItem(
+        STORAGE_KEYS.gasEndpointUrl,
+        inputGasEndpointUrl.value.trim()
+      );
+
+      await requestPersistentStorage();
       showStatus('設定を保存しました', 'success');
+
+      // トークン修正後などに、手動扱いで未送信画像を再試行する
+      await flushPendingQueue({ manual: true, quietWhenEmpty: true });
     });
 
     clearConfigBtn.addEventListener('click', () => {
       localStorage.removeItem(STORAGE_KEYS.cameraId);
       localStorage.removeItem(STORAGE_KEYS.location);
       localStorage.removeItem(STORAGE_KEYS.token);
+      localStorage.removeItem(STORAGE_KEYS.gasEndpointUrl);
       inputCameraId.value = '';
       inputLocation.value = '';
       inputToken.value = '';
-      showStatus('設定を削除しました', 'info');
+      inputGasEndpointUrl.value = '';
+      showStatus(
+        '設定を削除しました。未送信画像は端末内に保持されています',
+        'info'
+      );
     });
 
-    // 初期読み込み
-    loadConfig();
+    function getGasEndpointUrl() {
+      return inputGasEndpointUrl.value.trim();
+    }
+
+    function isValidGasEndpointUrl(url) {
+      return /^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec(?:\?.*)?$/.test(
+        String(url || '')
+      );
+    }
 
     // --- ステータス表示 ---
     function showStatus(msg, type = 'info') {
       statusDiv.style.display = 'block';
       statusDiv.textContent = msg;
       statusDiv.className = type;
+    }
+
+    function refreshControlStates() {
+      const cameraActive = Boolean(stream && stream.active);
+
+      manualCaptureBtn.disabled = !cameraActive || isCapturing;
+      startAutoCaptureBtn.disabled =
+        !cameraActive || isAutoCaptureRunning;
+      stopAutoCaptureBtn.disabled = !isAutoCaptureRunning;
+      retryPendingBtn.disabled =
+        pendingCount === 0 || isQueueFlushing || !navigator.onLine;
+    }
+
+    function updateQueueStatusDisplay() {
+      const networkText = navigator.onLine ? 'オンライン' : 'オフライン';
+      queueStatusDiv.textContent =
+        `未送信画像: ${pendingCount}件 / 通信状態: ${networkText}`;
+      refreshControlStates();
+    }
+
+    // --- IndexedDB（画像の端末内一時保存） ---
+    function openDatabase() {
+      if (!('indexedDB' in window)) {
+        return Promise.reject(
+          new Error('このブラウザは端末内一時保存に対応していません')
+        );
+      }
+
+      if (dbPromise) {
+        return dbPromise;
+      }
+
+      dbPromise = new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onupgradeneeded = (event) => {
+          const db = event.target.result;
+
+          if (!db.objectStoreNames.contains(STORE_NAME)) {
+            const store = db.createObjectStore(STORE_NAME, {
+              keyPath: 'request_id'
+            });
+            store.createIndex('created_at', 'created_at', {
+              unique: false
+            });
+          }
+        };
+
+        request.onsuccess = () => {
+          const db = request.result;
+          db.onversionchange = () => db.close();
+          resolve(db);
+        };
+
+        request.onerror = () => {
+          dbPromise = null;
+          reject(request.error || new Error('端末内保存DBを開けません'));
+        };
+
+        request.onblocked = () => {
+          dbPromise = null;
+          reject(
+            new Error('端末内保存DBの更新が他の画面でブロックされています')
+          );
+        };
+      });
+
+      return dbPromise;
+    }
+
+    async function countPendingImages() {
+      const db = await openDatabase();
+
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction(STORE_NAME, 'readonly');
+        const request = transaction.objectStore(STORE_NAME).count();
+
+        request.onsuccess = () => resolve(request.result || 0);
+        request.onerror = () => reject(request.error);
+      });
+    }
+
+    async function getAllPendingImages() {
+      const db = await openDatabase();
+
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction(STORE_NAME, 'readonly');
+        const request = transaction.objectStore(STORE_NAME).getAll();
+
+        request.onsuccess = () => {
+          const items = Array.isArray(request.result)
+            ? request.result
+            : [];
+
+          items.sort((a, b) =>
+            Number(a.created_at || 0) - Number(b.created_at || 0)
+          );
+
+          resolve(items);
+        };
+        request.onerror = () => reject(request.error);
+      });
+    }
+
+    async function putPendingImage(item, enforceLimit = false) {
+      if (enforceLimit) {
+        const currentCount = await countPendingImages();
+        if (currentCount >= MAX_PENDING_ITEMS) {
+          throw new Error(
+            `未送信画像が上限${MAX_PENDING_ITEMS}件に達しました`
+          );
+        }
+      }
+
+      const db = await openDatabase();
+
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction(STORE_NAME, 'readwrite');
+        transaction.objectStore(STORE_NAME).put(item);
+
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(
+          transaction.error || new Error('端末内への画像保存に失敗しました')
+        );
+        transaction.onabort = () => reject(
+          transaction.error || new Error('端末内への画像保存が中断されました')
+        );
+      });
+    }
+
+    async function deletePendingImage(requestId) {
+      const db = await openDatabase();
+
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction(STORE_NAME, 'readwrite');
+        transaction.objectStore(STORE_NAME).delete(requestId);
+
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(
+          transaction.error || new Error('送信済み画像の整理に失敗しました')
+        );
+        transaction.onabort = () => reject(
+          transaction.error || new Error('送信済み画像の整理が中断されました')
+        );
+      });
+    }
+
+    async function refreshPendingCount() {
+      try {
+        pendingCount = await countPendingImages();
+      } catch (err) {
+        pendingCount = 0;
+        console.error('未送信件数の取得エラー:', err);
+        queueStatusDiv.textContent =
+          `端末内一時保存エラー: ${err.message}`;
+        queueStatusDiv.className = 'error';
+        refreshControlStates();
+        return;
+      }
+
+      queueStatusDiv.className = 'info';
+      updateQueueStatusDisplay();
+    }
+
+    async function requestPersistentStorage() {
+      try {
+        if (
+          navigator.storage &&
+          typeof navigator.storage.persist === 'function'
+        ) {
+          await navigator.storage.persist();
+        }
+      } catch (err) {
+        console.log('永続ストレージ要求エラー:', err.message);
+      }
+    }
+
+    // --- request_id生成 ---
+    function generateRequestId(cameraId) {
+      let uniquePart = '';
+
+      if (
+        window.crypto &&
+        typeof window.crypto.randomUUID === 'function'
+      ) {
+        uniquePart = window.crypto.randomUUID();
+      } else {
+        const randomPart = Math.random()
+          .toString(36)
+          .slice(2, 14);
+        uniquePart =
+          `${Date.now().toString(36)}-${randomPart}`;
+      }
+
+      return `${cameraId}-${uniquePart}`;
     }
 
     // --- 自動撮影カウントダウン ---
@@ -219,23 +479,246 @@ const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
       }
     }
 
+    // --- 通信処理 ---
+    async function sendPendingImage(item, token, gasEndpointUrl) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+      }, FETCH_TIMEOUT_MS);
+
+      try {
+        const payload = {
+          camera_id: item.camera_id,
+          location: item.location,
+          token: token,
+          image_data: item.image_data,
+          request_id: item.request_id,
+          captured_at: item.captured_at
+        };
+
+        const response = await fetch(gasEndpointUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'text/plain;charset=utf-8'
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        let resData;
+        try {
+          resData = await response.json();
+        } catch (err) {
+          throw new Error('サーバー応答を読み取れませんでした');
+        }
+
+        if (resData && resData.status === 'success') {
+          return {
+            success: true,
+            duplicate: Boolean(resData.duplicate),
+            message: resData.message || '保存成功'
+          };
+        }
+
+        return {
+          success: false,
+          serverError: true,
+          message: resData && resData.message
+            ? resData.message
+            : '不明な保存エラー'
+        };
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          throw new Error('通信がタイムアウトしました');
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    function isAutomaticallyRetryableServerError(message) {
+      return /混み合|少し待|一時的|タイムアウト|連続送信/.test(
+        String(message || '')
+      );
+    }
+
+    async function markPendingFailure(item, message, manualOnly) {
+      const updatedItem = {
+        ...item,
+        retry_count: Number(item.retry_count || 0) + 1,
+        last_error: String(message || ''),
+        last_attempt_at: new Date().toISOString(),
+        manual_retry_only: Boolean(manualOnly)
+      };
+
+      await putPendingImage(updatedItem, false);
+    }
+
+    async function flushPendingQueue(options = {}) {
+      const manual = Boolean(options.manual);
+      const quietWhenEmpty = Boolean(options.quietWhenEmpty);
+
+      if (isQueueFlushing) {
+        return;
+      }
+
+      await refreshPendingCount();
+
+      if (pendingCount === 0) {
+        if (!quietWhenEmpty) {
+          showStatus('未送信画像はありません', 'info');
+        }
+        return;
+      }
+
+      if (!navigator.onLine) {
+        showStatus(
+          `オフラインです。${pendingCount}件を端末内に保持しています`,
+          'info'
+        );
+        return;
+      }
+
+      const gasEndpointUrl = getGasEndpointUrl();
+      if (!isValidGasEndpointUrl(gasEndpointUrl)) {
+        showStatus(
+          'エラー: GAS WebアプリURLを設定保存してください',
+          'error'
+        );
+        return;
+      }
+
+      const currentCameraId = inputCameraId.value.trim();
+      const token = inputToken.value.trim();
+
+      if (!currentCameraId || !token) {
+        showStatus(
+          '未送信画像の再送にはカメラIDとトークンが必要です',
+          'error'
+        );
+        return;
+      }
+
+      isQueueFlushing = true;
+      refreshControlStates();
+
+      let sentCount = 0;
+      let duplicateCount = 0;
+      let stoppedMessage = '';
+
+      try {
+        const items = await getAllPendingImages();
+
+        for (const item of items) {
+          if (item.manual_retry_only && !manual) {
+            stoppedMessage =
+              'サーバーエラーで停止中の画像があります。「未送信画像を再送」を押してください';
+            break;
+          }
+
+          if (item.camera_id !== currentCameraId) {
+            stoppedMessage =
+              `未送信画像のカメラID（${item.camera_id}）と現在の設定が一致しません`;
+            break;
+          }
+
+          showStatus(
+            `未送信画像を再送中...（${sentCount + 1}/${items.length}）`,
+            'info'
+          );
+
+          try {
+            const result = await sendPendingImage(
+              item,
+              token,
+              gasEndpointUrl
+            );
+
+            if (result.success) {
+              await deletePendingImage(item.request_id);
+              sentCount += 1;
+              if (result.duplicate) {
+                duplicateCount += 1;
+              }
+              continue;
+            }
+
+            const manualOnly =
+              !isAutomaticallyRetryableServerError(result.message);
+
+            await markPendingFailure(
+              item,
+              result.message,
+              manualOnly
+            );
+
+            stoppedMessage = manualOnly
+              ? `保存エラー: ${result.message}（設定確認後に手動再送してください）`
+              : `一時的な保存エラー: ${result.message}`;
+            break;
+          } catch (err) {
+            await markPendingFailure(item, err.message, false);
+            stoppedMessage = navigator.onLine
+              ? `通信エラー: ${err.message}。端末内に保持して再試行します`
+              : '通信が切断されました。端末内に保持して再試行します';
+            break;
+          }
+        }
+      } catch (err) {
+        stoppedMessage = `再送処理エラー: ${err.message}`;
+      } finally {
+        isQueueFlushing = false;
+        await refreshPendingCount();
+      }
+
+      if (pendingCount === 0 && sentCount > 0) {
+        const duplicateText = duplicateCount > 0
+          ? `（保存済み確認 ${duplicateCount}件を含む）`
+          : '';
+        showStatus(
+          `送信完了: ${sentCount}件 ${duplicateText}`,
+          'success'
+        );
+      } else if (stoppedMessage) {
+        showStatus(stoppedMessage, stoppedMessage.includes('エラー')
+          ? 'error'
+          : 'info');
+      } else if (sentCount > 0) {
+        showStatus(
+          `${sentCount}件を送信しました。未送信は${pendingCount}件です`,
+          'success'
+        );
+      }
+    }
+
     // --- カメラ操作 ---
     startCameraBtn.addEventListener('click', async () => {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment' },
+          audio: false
+        });
         video.srcObject = stream;
-        
-        manualCaptureBtn.disabled = false;
-        startAutoCaptureBtn.disabled = false;
+
+        await requestPersistentStorage();
+        refreshControlStates();
         showStatus('カメラを起動しました', 'success');
       } catch (err) {
-        showStatus(`カメラ起動エラー: ${err.name} - ${err.message}`, 'error');
+        showStatus(
+          `カメラ起動エラー: ${err.name} - ${err.message}`,
+          'error'
+        );
       }
     });
 
     async function captureAndSend() {
-      if (isSending) {
-        showStatus('送信中のため、今回の撮影は見送りました', 'info');
+      if (isCapturing) {
+        showStatus('撮影処理中のため、今回の撮影は見送りました', 'info');
         return;
       }
 
@@ -243,35 +726,50 @@ const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
       const location = inputLocation.value.trim();
       const token = inputToken.value.trim();
 
-      // 送信条件のチェック
       if (!cameraId || !location || !token) {
-        showStatus('エラー: カメラID、設置場所、トークンをすべて入力・保存してください', 'error');
+        showStatus(
+          'エラー: カメラID、設置場所、トークンをすべて入力・保存してください',
+          'error'
+        );
+        return;
+      }
+      if (!/^CAM-\d{3}$/.test(cameraId)) {
+        showStatus('エラー: カメラIDの形式が正しくありません', 'error');
         return;
       }
       if (!stream || !stream.active) {
-        showStatus('エラー: カメラが停止しています。再度カメラを起動してください', 'error');
+        showStatus(
+          'エラー: カメラが停止しています。再度カメラを起動してください',
+          'error'
+        );
         return;
       }
       if (video.videoWidth === 0 || video.videoHeight === 0) {
         showStatus('エラー: 撮影画像がまだ生成されていません', 'error');
         return;
       }
-      if (GAS_ENDPOINT_URL === "__GAS_WEB_APP_URL__") {
-        showStatus('エラー: GAS URL未設定。送信を停止しました', 'error');
+      const gasEndpointUrl = getGasEndpointUrl();
+      if (!isValidGasEndpointUrl(gasEndpointUrl)) {
+        showStatus(
+          'エラー: GAS WebアプリURLを設定保存してください',
+          'error'
+        );
         return;
       }
 
-      // 手動撮影と自動撮影の重複送信を防止
-      isSending = true;
-      manualCaptureBtn.disabled = true;
-      showStatus('送信準備中...', 'info');
+      isCapturing = true;
+      refreshControlStates();
+      showStatus('撮影画像を端末へ保存しています...', 'info');
 
       try {
-        // 画像の圧縮設定 (長辺1280px程度)
+        const capturedAt = new Date().toISOString();
+        const requestId = generateRequestId(cameraId);
+
+        // 画像の圧縮設定（長辺1280px程度）
         const MAX_DIMENSION = 1280;
         let width = video.videoWidth;
         let height = video.videoHeight;
-        
+
         if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
           if (width > height) {
             height = Math.floor(height * (MAX_DIMENSION / width));
@@ -286,50 +784,55 @@ const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
         canvas.height = height;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(video, 0, 0, width, height);
-        
-        // JPEG品質0.8
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.80);
-        // Base64本体のみを抽出
-        const base64Data = dataUrl.replace(/^data:image\/jpeg;base64,/, "");
 
-        const payload = {
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.80);
+        const base64Data = dataUrl.replace(
+          /^data:image\/jpeg;base64,/,
+          ''
+        );
+
+        const pendingItem = {
+          request_id: requestId,
+          captured_at: capturedAt,
           camera_id: cameraId,
           location: location,
-          token: token,
-          image_data: base64Data
+          image_data: base64Data,
+          created_at: Date.now(),
+          retry_count: 0,
+          last_error: '',
+          last_attempt_at: '',
+          manual_retry_only: false
         };
 
-        showStatus('送信中...', 'info');
+        // 通信前に必ず端末内へ保存する。
+        // 応答が失われても同じrequest_idで再送できる。
+        await putPendingImage(pendingItem, true);
+        await refreshPendingCount();
 
-        // CORSプリフライト回避のため text/plain で送信
-        const response = await fetch(GAS_ENDPOINT_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'text/plain;charset=utf-8'
-          },
-          body: JSON.stringify(payload)
-        });
-        
-        const resData = await response.json();
-        
-        if (resData && resData.status === 'success') {
-          showStatus(`保存成功: ${new Date().toLocaleTimeString()}`, 'success');
-        } else {
-          // 認証失敗やGAS側のバリデーションエラー
-          // ※トークンは自動削除せず、修正できるように残す
-          const errMsg = resData ? resData.message : "不明なエラー";
-          showStatus(`認証失敗 / 保存エラー: ${errMsg}`, 'error');
-        }
+        showStatus(
+          `撮影画像を端末へ保存しました。未送信 ${pendingCount}件`,
+          'info'
+        );
+
+        await flushPendingQueue({ quietWhenEmpty: true });
       } catch (err) {
-        showStatus(`通信エラー: ${err.message}`, 'error');
-      } finally {
-        isSending = false;
+        const storageFull =
+          err && (
+            err.name === 'QuotaExceededError' ||
+            String(err.message || '').includes('上限')
+          );
 
-        // 数秒後にボタンを再度有効化（連続クリック防止）
+        showStatus(
+          storageFull
+            ? `端末内の保存容量が不足しています: ${err.message}`
+            : `撮影保存エラー: ${err.message}`,
+          'error'
+        );
+      } finally {
+        isCapturing = false;
+
         setTimeout(() => {
-          if (stream && stream.active) {
-            manualCaptureBtn.disabled = false;
-          }
+          refreshControlStates();
         }, 3000);
       }
     }
@@ -349,7 +852,6 @@ const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
         try {
           await captureAndSend();
         } catch (err) {
-          // 1回失敗しても自動撮影自体は停止しない
           showStatus(`自動撮影エラー: ${err.message}`, 'error');
         } finally {
           if (isAutoCaptureRunning) {
@@ -360,8 +862,6 @@ const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
     }
 
     async function startAutoCapture() {
-
-      // 二重タイマー防止
       if (isAutoCaptureRunning) {
         showStatus('自動撮影はすでに開始されています', 'info');
         return;
@@ -373,8 +873,7 @@ const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
       }
 
       isAutoCaptureRunning = true;
-      startAutoCaptureBtn.disabled = true;
-      stopAutoCaptureBtn.disabled = false;
+      refreshControlStates();
 
       await requestWakeLock();
 
@@ -383,15 +882,12 @@ const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
         'info'
       );
 
-      // 開始直後に1枚撮影
       try {
         await captureAndSend();
       } catch (err) {
         showStatus(`自動撮影エラー: ${err.message}`, 'error');
       }
 
-      // 最初の撮影中に停止ボタンが押された場合は、
-      // タイマーを開始しない
       if (!isAutoCaptureRunning) {
         return;
       }
@@ -408,41 +904,66 @@ const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
       }
 
       stopCountdown();
-
-      startAutoCaptureBtn.disabled =
-        !(stream && stream.active);
-      stopAutoCaptureBtn.disabled = true;
+      refreshControlStates();
 
       await releaseWakeLock();
 
       showStatus('自動撮影を停止しました', 'info');
     }
 
-    manualCaptureBtn.addEventListener(
-      'click',
-      captureAndSend
-    );
+    manualCaptureBtn.addEventListener('click', captureAndSend);
+    startAutoCaptureBtn.addEventListener('click', startAutoCapture);
+    stopAutoCaptureBtn.addEventListener('click', stopAutoCapture);
+    retryPendingBtn.addEventListener('click', async () => {
+      await flushPendingQueue({ manual: true });
+    });
 
-    startAutoCaptureBtn.addEventListener(
-      'click',
-      startAutoCapture
-    );
+    // 通信回復時に自動再送
+    window.addEventListener('online', async () => {
+      updateQueueStatusDisplay();
+      showStatus('通信が回復しました。未送信画像を再送します', 'info');
+      await flushPendingQueue({ quietWhenEmpty: true });
+    });
 
-    stopAutoCaptureBtn.addEventListener(
-      'click',
-      stopAutoCapture
-    );
+    window.addEventListener('offline', () => {
+      updateQueueStatusDisplay();
+      showStatus(
+        'オフラインになりました。撮影画像は端末内に一時保存します',
+        'info'
+      );
+    });
 
-    // 別画面から戻った際にWake Lockを再取得
+    // 別画面から戻った際にWake Lockを再取得し、再送も試す
     document.addEventListener('visibilitychange', async () => {
-      if (
-        document.visibilityState === 'visible' &&
-        isAutoCaptureRunning &&
-        wakeLock === null
-      ) {
+      if (document.visibilityState !== 'visible') {
+        return;
+      }
+
+      if (isAutoCaptureRunning && wakeLock === null) {
         await requestWakeLock();
       }
+
+      await refreshPendingCount();
+      await flushPendingQueue({ quietWhenEmpty: true });
     });
+
+    // 1分ごとに未送信画像を確認
+    setInterval(async () => {
+      if (navigator.onLine) {
+        await flushPendingQueue({ quietWhenEmpty: true });
+      } else {
+        await refreshPendingCount();
+      }
+    }, RETRY_CHECK_INTERVAL_MS);
+
+    // 初期読み込み
+    loadConfig();
+    refreshControlStates();
+
+    (async () => {
+      await refreshPendingCount();
+      await flushPendingQueue({ quietWhenEmpty: true });
+    })();
   </script>
 </body>
 </html>
