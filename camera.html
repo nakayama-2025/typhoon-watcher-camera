@@ -38,6 +38,15 @@
     <label for="token">端末トークン</label>
     <input type="password" id="token" placeholder="トークンを入力">
   </div>
+  <div class="form-group">
+    <label for="gasEndpointUrl">GAS WebアプリURL（この端末内だけに保存）</label>
+    <input
+      type="password"
+      id="gasEndpointUrl"
+      placeholder="https://script.google.com/macros/s/.../exec"
+      autocomplete="off"
+    >
+  </div>
   <div>
     <button id="saveConfigBtn" class="btn-secondary">設定保存</button>
     <button id="clearConfigBtn" class="btn-danger">設定削除</button>
@@ -80,10 +89,8 @@
 
   <script>
     // ------------------------------------
-    // GASのURLはデプロイ後に手動で置き換えます
-    // ※ 秘密情報はコード内に直接書かないでください
+    // GAS URLは公開コードへ記載せず、各端末のlocalStorageへ保存する
     // ------------------------------------
-    const GAS_ENDPOINT_URL = "https://script.google.com/macros/s/AKfycbzi6yJz6vIEJ3c0g5P_QdZlXSMEOphWZCaZPxuCGGjLz0fBLxFlOcafKASK5S78bvelIQ/exec";
 
     // 自動撮影間隔：30分
     const AUTO_CAPTURE_INTERVAL_MS = 30 * 60 * 1000;
@@ -113,6 +120,7 @@
     const inputCameraId = document.getElementById('cameraId');
     const inputLocation = document.getElementById('location');
     const inputToken = document.getElementById('token');
+    const inputGasEndpointUrl = document.getElementById('gasEndpointUrl');
     const saveConfigBtn = document.getElementById('saveConfigBtn');
     const clearConfigBtn = document.getElementById('clearConfigBtn');
     const statusDiv = document.getElementById('status');
@@ -132,19 +140,35 @@
     const STORAGE_KEYS = {
       cameraId: 'typhoonWatcher.cameraId',
       location: 'typhoonWatcher.location',
-      token: 'typhoonWatcher.token'
+      token: 'typhoonWatcher.token',
+      gasEndpointUrl: 'typhoonWatcher.gasEndpointUrl'
     };
 
     function loadConfig() {
       inputCameraId.value = localStorage.getItem(STORAGE_KEYS.cameraId) || '';
       inputLocation.value = localStorage.getItem(STORAGE_KEYS.location) || '';
       inputToken.value = localStorage.getItem(STORAGE_KEYS.token) || '';
+      inputGasEndpointUrl.value =
+        localStorage.getItem(STORAGE_KEYS.gasEndpointUrl) || '';
     }
 
     saveConfigBtn.addEventListener('click', async () => {
+      const gasEndpointUrl = getGasEndpointUrl();
+      if (gasEndpointUrl && !isValidGasEndpointUrl(gasEndpointUrl)) {
+        showStatus(
+          'エラー: GAS WebアプリURLの形式を確認してください',
+          'error'
+        );
+        return;
+      }
+
       localStorage.setItem(STORAGE_KEYS.cameraId, inputCameraId.value.trim());
       localStorage.setItem(STORAGE_KEYS.location, inputLocation.value.trim());
       localStorage.setItem(STORAGE_KEYS.token, inputToken.value.trim());
+      localStorage.setItem(
+        STORAGE_KEYS.gasEndpointUrl,
+        inputGasEndpointUrl.value.trim()
+      );
 
       await requestPersistentStorage();
       showStatus('設定を保存しました', 'success');
@@ -157,14 +181,26 @@
       localStorage.removeItem(STORAGE_KEYS.cameraId);
       localStorage.removeItem(STORAGE_KEYS.location);
       localStorage.removeItem(STORAGE_KEYS.token);
+      localStorage.removeItem(STORAGE_KEYS.gasEndpointUrl);
       inputCameraId.value = '';
       inputLocation.value = '';
       inputToken.value = '';
+      inputGasEndpointUrl.value = '';
       showStatus(
         '設定を削除しました。未送信画像は端末内に保持されています',
         'info'
       );
     });
+
+    function getGasEndpointUrl() {
+      return inputGasEndpointUrl.value.trim();
+    }
+
+    function isValidGasEndpointUrl(url) {
+      return /^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec(?:\?.*)?$/.test(
+        String(url || '')
+      );
+    }
 
     // --- ステータス表示 ---
     function showStatus(msg, type = 'info') {
@@ -444,7 +480,7 @@
     }
 
     // --- 通信処理 ---
-    async function sendPendingImage(item, token) {
+    async function sendPendingImage(item, token, gasEndpointUrl) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => {
         controller.abort();
@@ -460,7 +496,7 @@
           captured_at: item.captured_at
         };
 
-        const response = await fetch(GAS_ENDPOINT_URL, {
+        const response = await fetch(gasEndpointUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'text/plain;charset=utf-8'
@@ -548,8 +584,12 @@
         return;
       }
 
-      if (GAS_ENDPOINT_URL === '__GAS_WEB_APP_URL__') {
-        showStatus('エラー: GAS URL未設定。再送を停止しました', 'error');
+      const gasEndpointUrl = getGasEndpointUrl();
+      if (!isValidGasEndpointUrl(gasEndpointUrl)) {
+        showStatus(
+          'エラー: GAS WebアプリURLを設定保存してください',
+          'error'
+        );
         return;
       }
 
@@ -593,7 +633,11 @@
           );
 
           try {
-            const result = await sendPendingImage(item, token);
+            const result = await sendPendingImage(
+              item,
+              token,
+              gasEndpointUrl
+            );
 
             if (result.success) {
               await deletePendingImage(item.request_id);
@@ -704,8 +748,12 @@
         showStatus('エラー: 撮影画像がまだ生成されていません', 'error');
         return;
       }
-      if (GAS_ENDPOINT_URL === '__GAS_WEB_APP_URL__') {
-        showStatus('エラー: GAS URL未設定。撮影を停止しました', 'error');
+      const gasEndpointUrl = getGasEndpointUrl();
+      if (!isValidGasEndpointUrl(gasEndpointUrl)) {
+        showStatus(
+          'エラー: GAS WebアプリURLを設定保存してください',
+          'error'
+        );
         return;
       }
 
